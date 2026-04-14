@@ -1,0 +1,25 @@
+{
+  "name": "lam",
+  "version": "1.0.0",
+  "description": "",
+  "main": "create_ppt.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JangWon-Smilegate/lam.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/JangWon-Smilegate/lam/issues"
+  },
+  "homepage": "https://github.com/JangWon-Smilegate/lam#readme",
+  "dependencies": {
+    "pptxgenjs": "^4.0.1",
+    "xml2js": "^0.6.2"
+  }
+}
