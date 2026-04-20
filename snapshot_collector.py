@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 LAM 업무 스냅샷 수집기
-매일 실행하여 부서별 업무 현황을 SQLite에 저장합니다.
+매일 실행하여 부서별 업무 현황을 SQLite에 저장하고,
+리포트 seq 매핑 테이블을 점검합니다.
 """
 import json
+import re
 import ssl
 import sqlite3
+import sys
 import urllib.request
 from datetime import date, datetime, timedelta
+from pathlib import Path
+
+# Windows cp949 환경에서 UTF-8 출력
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 BASE = "https://lam-web.sgr.com:8081/WORKDASHBOARDAPI"
 DB_PATH = "snapshots.db"
+CLAUDE_MD_PATH = Path(__file__).parent.parent / "CLAUDE.md"  # D:\Git\CLAUDE.md
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -120,24 +129,156 @@ def init_db():
         )
     """)
 
+    # 리포트 스냅샷 (seq 매핑 변경 추적)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS report_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            name TEXT,
+            desc TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(snapshot_date, seq)
+        )
+    """)
+
+    # 완료 전환 기록 (당일 새로 완료된 태스크)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_completed (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_date TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            title TEXT,
+            assignee TEXT,
+            department TEXT,
+            prev_status TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(detected_date, task_id)
+        )
+    """)
+
     conn.commit()
     return conn
+
+
+# ─────────────────────────────────────────────
+# 리포트 수집 & CLAUDE.md seq 매핑 갱신
+# ─────────────────────────────────────────────
+
+# CLAUDE.md에 표시할 리포트 키워드 (우선순위 순)
+REPORT_KEYWORDS = ["M29", "M28", "M27", "지연", "업무 현황", "타겟", "목표 작업 리스트", "주간 리포트"]
+MAX_REPORT_ROWS = 20
+
+
+def collect_reports(conn: sqlite3.Connection, group_id: int = 1) -> list:
+    """리포트 목록을 수집하고 DB에 저장. 변경 시 CLAUDE.md 갱신."""
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    data = _get(f"/reports?groupId={group_id}")
+    reports = data.get("data", [])
+
+    c = conn.cursor()
+
+    # 오늘 데이터 저장
+    for r in reports:
+        c.execute("""
+            INSERT OR REPLACE INTO report_snapshots (snapshot_date, seq, name, desc)
+            VALUES (?, ?, ?, ?)
+        """, (today, r["seq"], r["name"], r.get("desc", "")))
+    conn.commit()
+
+    # 어제 데이터와 비교
+    prev = {
+        row[0]: {"name": row[1], "desc": row[2]}
+        for row in c.execute(
+            "SELECT seq, name, desc FROM report_snapshots WHERE snapshot_date = ?",
+            (yesterday,)
+        ).fetchall()
+    }
+
+    changes = []
+    current_seqs = {r["seq"] for r in reports}
+    prev_seqs = set(prev.keys())
+
+    for r in reports:
+        if r["seq"] not in prev_seqs:
+            changes.append(f"  ✨ 신규: [seq:{r['seq']}] {r['name']}")
+        elif prev[r["seq"]]["name"] != r["name"]:
+            changes.append(f"  ✏️  이름변경: [seq:{r['seq']}] {prev[r['seq']]['name']} → {r['name']}")
+
+    for seq in prev_seqs - current_seqs:
+        changes.append(f"  🗑️  삭제: [seq:{seq}] {prev[seq]['name']}")
+
+    if changes:
+        print(f"  리포트 변경 감지 ({len(changes)}건):")
+        for msg in changes:
+            print(msg)
+        _update_claude_md_reports(reports)
+    else:
+        print(f"  리포트 변경 없음 (총 {len(reports)}개)")
+
+    return reports
+
+
+def _update_claude_md_reports(reports: list):
+    """CLAUDE.md의 주요 리포트 seq 매핑 테이블을 갱신."""
+    if not CLAUDE_MD_PATH.exists():
+        print(f"  ⚠️  CLAUDE.md 없음: {CLAUDE_MD_PATH}")
+        return
+
+    # 주요 리포트 선별 & 정렬
+    important = [
+        r for r in reports
+        if any(kw in r.get("name", "") for kw in REPORT_KEYWORDS)
+    ]
+    important = sorted(important, key=lambda x: x["seq"], reverse=True)[:MAX_REPORT_ROWS]
+
+    # 테이블 생성
+    rows = ["| seq | 리포트명 | 설명 |", "|---|---|---|"]
+    for r in important:
+        name = r["name"].replace("|", "｜")
+        desc = (r.get("desc", "") or "").replace("|", "｜").strip()
+        rows.append(f"| {r['seq']} | {name} | {desc} |")
+    new_table = "\n".join(rows)
+
+    content = CLAUDE_MD_PATH.read_text(encoding="utf-8")
+
+    # 패턴: "**주요 리포트 seq 매핑" 으로 시작하는 헤더 + 이어지는 테이블 행 교체
+    # [^\n]* 로 헤더 끝 부분을 유연하게 매칭 (특수문자·이모지 포함 대응)
+    pattern = r'(\*\*주요 리포트 seq 매핑[^\n]*\n)((?:\|[^\n]*\n)+)'
+    replacement = f'**주요 리포트 seq 매핑 (자주 사용):**\n{new_table}\n'
+    new_content, n = re.subn(pattern, replacement, content)
+
+    if n == 0:
+        print(f"  ⚠️  CLAUDE.md 패턴 매칭 실패 — 수동 확인 필요")
+    elif new_content != content:
+        CLAUDE_MD_PATH.write_text(new_content, encoding="utf-8")
+        print(f"  ✅ CLAUDE.md seq 매핑 테이블 업데이트 완료 ({len(important)}개 리포트)")
+    else:
+        print(f"  ✅ CLAUDE.md seq 매핑 테이블 이미 최신 ({len(important)}개 리포트, 변경 없음)")
 
 
 def collect_snapshot(group_id: int = 1):
     today = date.today()
     today_str = today.isoformat()
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 스냅샷 수집 시작: {today_str}")
+    print(f"  [{datetime.now().strftime('%H:%M:%S')}] 수집 시작: {today_str}")
 
     # API에서 전체 업무 조회
     data = _get(f"/tasks?groupId={group_id}")
     tasks = data.get("data", [])
     print(f"  전체 업무: {len(tasks)}건")
 
-    # 활성 업무만 필터 (완료 제외)
-    active_statuses = {"진행중", "진행 중", "미완료", "보류", "할 일", "다시 열림", "검토 중"}
-    active_tasks = [t for t in tasks if t.get("status") in active_statuses]
+    # 활성 업무만 필터: 제외 상태를 명시 → 새 상태 자동 포함
+    # Backlog(저장소), Pending(외부대기), 완료(종결) 제외
+    EXCLUDE_STATUSES = {"완료", "Backlog", "Pending"}
+    active_tasks = [t for t in tasks if (t.get("status") or "") not in EXCLUDE_STATUSES]
+
+    # 완료 태스크 맵 (전환 감지용)
+    all_tasks_map = {str(t.get("id", "")): t for t in tasks}
 
     # 부서별 집계
     dept_stats = {}
@@ -297,17 +438,45 @@ def collect_snapshot(group_id: int = 1):
                 """, (today_str, tid, t.get("title", ""), "assignee_change", "assignee", prev["assignee"], assignee))
                 changes_count += 1
 
+    # ── 완료 전환 감지 ──────────────────────────────────────
+    # 어제 활성 태스크 중 오늘 "완료" 상태로 바뀐 것을 기록
+    completed_count = 0
+    for tid, prev in yesterday_tasks.items():
+        current = all_tasks_map.get(tid)
+        if current is None:
+            continue
+        current_status = current.get("status", "")
+        if current_status == "완료" and prev["status"] != "완료":
+            # task_changes에 완료 전환 기록
+            c.execute("""INSERT OR IGNORE INTO task_changes
+                (detected_date, task_id, title, change_type, field_name, old_value, new_value)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (today_str, tid, current.get("title", ""), "status_change",
+                  "status", prev["status"], "완료"))
+            # daily_completed에 저장
+            c.execute("""
+                INSERT OR IGNORE INTO daily_completed
+                (detected_date, task_id, title, assignee, department, prev_status, start_date, end_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (today_str, tid, current.get("title", ""),
+                  current.get("assignee", "미배정"),
+                  _shorten_dept(current.get("department", "")),
+                  prev["status"],
+                  (current.get("start") or "")[:10],
+                  (current.get("end") or "")[:10]))
+            completed_count += 1
+
     conn.commit()
-    conn.close()
 
     # 결과 출력
     total_all = sum(s["total"] for s in dept_stats.values())
     total_delayed = sum(s["delayed"] for s in dept_stats.values())
     total_dday = sum(s["d_day"] for s in dept_stats.values())
     print(f"  활성 업무: {total_all}건 | 지연: {total_delayed}건 | D-day: {total_dday}건")
-    print(f"  태스크 저장: {len(active_tasks)}건 | 변경 감지: {changes_count}건")
+    print(f"  태스크 저장: {len(active_tasks)}건 | 변경 감지: {changes_count}건 | 신규 완료: {completed_count}건")
     print(f"  부서: {len(dept_stats)}개 | 담당자: {len(member_stats)}명")
-    print(f"  저장 완료: {DB_PATH}")
+
+    return conn
 
 
 def _shorten_dept(dept: str) -> str:
@@ -325,5 +494,23 @@ def _shorten_dept(dept: str) -> str:
     return parts[0]
 
 
+def main():
+    print(f"\n{'='*50}")
+    print(f" LAM 스냅샷 수집 시작: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*50}")
+
+    # 1. 태스크 스냅샷 수집
+    print("\n[1/2] 태스크 스냅샷 수집 중...")
+    conn = collect_snapshot()
+
+    # 2. 리포트 seq 매핑 점검
+    print("\n[2/2] 리포트 seq 매핑 점검 중...")
+    collect_reports(conn)
+
+    conn.close()
+    print(f"\n✅ 저장 완료: {DB_PATH}")
+    print(f"{'='*50}\n")
+
+
 if __name__ == "__main__":
-    collect_snapshot()
+    main()
